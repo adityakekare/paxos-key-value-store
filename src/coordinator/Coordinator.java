@@ -1,137 +1,134 @@
 package coordinator;
 
-import java.rmi.Remote;
+import java.io.Serializable;
+import java.rmi.NotBoundException;
 import java.rmi.RemoteException;
-import java.sql.Timestamp;
+import java.rmi.registry.LocateRegistry;
+import java.rmi.registry.Registry;
 import java.util.ArrayList;
-import java.util.Date;
 import java.util.List;
-import java.util.Map;
-import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 
-import server.TwoPCServer;
-import service.RpcService;
+import paxos.Promise;
+import paxos.Proposal;
+import paxos.Status;
+import server.PaxosServer;
 
-public class Coordinator implements TwoPCCoordinator {
+public class Coordinator implements PaxosCoordinator, Serializable {
 
-  List<TwoPCServer> dataStores;
-  ExecutorService executorService = Executors.newFixedThreadPool(10);
+  List<PaxosServer> dataStores;
 
   public Coordinator() {
     this.dataStores = new ArrayList<>();
   }
 
-  public void registerNewServer(TwoPCServer server) {
+  public void registerNewServer(PaxosServer server) {
     dataStores.add(server);
   }
 
   @Override
-  public String twoPhaseProtocol(String operation, int key, String value) {
-      // Unique ID generated for the connected client
-      UUID clientId = UUID.randomUUID();
-      if(!executePreparePhase(operation, key, clientId)){
-        System.out.println("Server is busy. Please try again later.");
-        System.out.println("Aborting operation...");
-        return "400";
-      }
-      else if(!executeCommitPhase(operation, key, value, clientId)){
-        System.out.println("Error occurred during commit");
-        System.out.println("Aborting commit operation...");
-        return "400";
-      }
+  public String executeOperation(Proposal proposal) throws RemoteException {
+    Registry registry = null;
+    List<PaxosServer> acceptors = new ArrayList<>();
+    // List to store servers that are down
+    List<PaxosServer> failedServers = new ArrayList<>();
+    // Locates the registry
+    registry = LocateRegistry.getRegistry(null);
 
-    if(operation.equals("GET")){
-      return "200";
-    }
-    else if(operation.equals("PUT")){
-      // Execute PUT request on all server replicas
-      for(TwoPCServer store: dataStores) {
-        executorService.submit(() -> {
-          store.executePut(key, value);
-        });
-      }
-    }
-    else{
-      // Execute DELETE request on all server replicas
-      for(TwoPCServer store: dataStores) {
-        executorService.submit(() -> {
-          store.executeDelete(key);
-        });
-      }
-    }
-      return "200";
-  }
 
-  private boolean executeCommitPhase(String operation, int key, String value, UUID clientId) {
-    List<Future<Boolean>> futures = new ArrayList<>();
-    System.out.println("[" + new Timestamp(new Date().getTime()).toString() + "]"
-            + " Initiating commit phase for all servers...");
-
-    // Initiate commit phase on all replicas
-    for(TwoPCServer store: dataStores) {
-      Future<Boolean> future = executorService.submit(() -> {
-        return store.confirmCommit(operation, key, value, clientId);
-      });
-      futures.add(future);
-    }
-
-    int count = 0;
-    for(Future<Boolean> future: futures){
+    int i = 1;
+    for(PaxosServer server: dataStores){
       try{
-        if(future.get().equals(true)){
-          count += 1;
-        }
-        else {
-          Thread.sleep(2000);
-          if(future.get().equals(true)){
-            count += 1;
-          }
-        }
-      } catch (InterruptedException | ExecutionException e) {
-        e.printStackTrace();
+        // Lookup the server remote object in the registry
+        PaxosServer acceptor = (PaxosServer) registry.lookup("KeyValueStore" + i);
+        acceptors.add(acceptor);
+        i += 1;
+      } catch (NotBoundException e) {
+        System.out.println("Server at port " + server.getPort() + " is down");
       }
     }
 
-    // If all servers are ready, return true
-    return count == dataStores.size();
-  }
+    int half = Math.floorDiv(acceptors.size(), 2) + 1;
+    int numPromised = 0;
 
-  private boolean executePreparePhase(String operation, int key, UUID clientId){
-    List<Future<Boolean>> futures = new ArrayList<>();
-    System.out.println("[" + new Timestamp(new Date().getTime()).toString() + "]"
-            + " Initiating prepare phase for all servers...");
-
-    // Initiate prepare phase on all server replicas
-    for(TwoPCServer store: dataStores) {
-        Future<Boolean> future = executorService.submit(() -> {
-          return store.confirmPrepare(operation, key, clientId);
-        });
-        futures.add(future);
-    }
-
-    int count = 0;
-    for(Future<Boolean> future: futures){
+    for(PaxosServer acceptor: acceptors){
       try{
-        if(future.get().equals(true)){
-          count += 1;
+        Promise promise = acceptor.prepare(proposal);
+        if(promise == null){
+          System.out.println("Server at port " + acceptor.getPort() + " is down");
+          failedServers.add(acceptor);
         }
-        else {
-          Thread.sleep(2000);
-          if(future.get().equals(true)){
-            count += 1;
-          }
+        else if(promise.getStatus() == Status.PROMISED || promise.getStatus() == Status.ACCEPTED){
+          numPromised += 1;
+          System.out.println("Server at port " + acceptor.getPort() + " has PROMISED proposal " +
+                  proposal.getOperation().getMethod() + "(" + proposal.getOperation().getKey() +
+                  "," + proposal.getOperation().getValue() + ")");
         }
-      } catch (InterruptedException | ExecutionException e) {
-        e.printStackTrace();
+        else{
+          System.out.println("Server at port " + acceptor.getPort() + " has REJECTED proposal " +
+                  proposal.getOperation().getMethod() + "(" + proposal.getOperation().getKey() +
+                  "," + proposal.getOperation().getValue() + ")");
+        }
+      } catch (Exception e) {
+        System.out.println("Server at port " + acceptor.getPort() + " is NOT RESPONDING to the proposal " +
+                proposal.getOperation().getMethod() + "(" + proposal.getOperation().getKey() +
+                "," + proposal.getOperation().getValue() + ")");
       }
     }
 
-    // return true if all servers are prepared
-    return count == dataStores.size();
+    // Check the majority
+    if(numPromised < half){
+      return "Consensus not reached";
+    }
+
+    // Remove servers that are down from the acceptors list
+    for(PaxosServer acceptor: failedServers){
+      acceptors.remove(acceptor);
+    }
+    // Empty the servers that are down list
+    failedServers.clear();
+
+
+    int accepted = 0;
+    for(PaxosServer acceptor: acceptors){
+      try{
+        Boolean isAccepted = acceptor.accept(proposal);
+
+        if(isAccepted == null){
+          System.out.println("Server at port " + acceptor.getPort() + " is NOT RESPONDING to the proposal " +
+                  proposal.getOperation().getMethod() + "(" + proposal.getOperation().getKey() +
+                  "," + proposal.getOperation().getValue() + ")");
+          failedServers.add(acceptor);
+        }
+        else if(isAccepted){
+          accepted += 1;
+          System.out.println("Server at port " + acceptor.getPort() + " has ACCEPTED proposal " +
+                  proposal.getOperation().getMethod() + "(" + proposal.getOperation().getKey() +
+                  "," + proposal.getOperation().getValue() + ")");
+
+        }
+      } catch (Exception ignored) {
+      }
+    }
+
+    // Check the majority
+    if(accepted < half){
+      return "Consensus not reached";
+    }
+
+    // Remove servers that are down from the acceptors list
+    for(PaxosServer acceptor: failedServers){
+      acceptors.remove(acceptor);
+    }
+
+    String result = "";
+
+    for(PaxosServer acceptor: acceptors){
+      try{
+        result = acceptor.learn(proposal);
+      } catch (Exception ignored) {
+      }
+    }
+
+    return result;
   }
 }
